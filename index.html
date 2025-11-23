@@ -56,12 +56,20 @@
           </div>
 
           <div class="actions">
-            <button id="useLoc" class="secondary" type="button">Use my location</button>
+            <button id="useLoc" type="button">Use my location</button>
             <button id="searchBtn" type="button">Find Ads</button>
             <button id="clearBtn" type="button" class="secondary">Clear</button>
             <div style="margin-left:auto" class="small" id="status">Ready</div>
           </div>
         </div>
+
+                <div id="demoBanner"
+             style="display:none;margin-top:8px;margin-bottom:4px;padding:6px 10px;
+                    border-radius:8px;background:#3b2a12;color:#ffd27f;font-size:12px;">
+          Using demo ads because the free Google Search API quota is exhausted.
+        </div>
+
+        <div class="results" id="results"></div>
 
         <div class="results" id="results"></div>
       </div>
@@ -81,6 +89,7 @@
           clearBtn = document.getElementById('clearBtn'),
           status = document.getElementById('status'),
           results = document.getElementById('results');
+          demoBanner = document.getElementById('demoBanner');
 
     let map = L.map('map').setView([20.5937,78.9629], 5);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
@@ -127,6 +136,15 @@
         const r = await fetch(url);
         if (!r.ok) { setStatus('Server error: ' + r.status); return; }
         const ads = await r.json();
+        // reset banner
+        if (demoBanner) demoBanner.style.display = 'none';
+
+        // if all ads are our demo ones (title contains "Demo"), show banner
+        const allDemo = ads.length > 0 && ads.every(ad => (ad.title || '').includes('Demo'));
+        if (allDemo && demoBanner) {
+          demoBanner.style.display = 'block';
+        }
+
         setStatus(`Received ${ads.length} ads`);
 
         // add markers for ads that have coords

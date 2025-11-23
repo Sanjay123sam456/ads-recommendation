@@ -34,6 +34,25 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
 CACHE_TTL = 300
 DEFAULT_RADIUS_METERS = 2000
 DEFAULT_LIMIT = 20
+# ---------------- DEMO ADS FALLBACK ----------------
+SAMPLE_ADS = [
+    {
+        "title": "Sample Electronics Offer – Demo",
+        "ad_text": "Up to 30% off on gadgets near you. (Demo data shown due to API quota limit.)",
+        "source_link": "https://example.com/electronics"
+    },
+    {
+        "title": "Demo Fashion Sale – Nearby",
+        "ad_text": "Trending clothing and accessories — demo preview when live data is unavailable.",
+        "source_link": "https://example.com/fashion"
+    },
+    {
+        "title": "Grocery Savings – Demo",
+        "ad_text": "Daily essentials at discounted prices — demo ad for UI testing.",
+        "source_link": "https://example.com/grocery"
+    },
+]
+
 
 # ---------------- MODELS ----------------
 class POI(BaseModel):
@@ -249,6 +268,21 @@ def recommend_ads(
 
     all_cse = dedupe_cse_items(all_cse)
     ic("Google CSE combined results (deduped):", [it.dict() for it in all_cse])
+                # If Google CSE returned no results (quota exhausted / error), return demo ads
+    if not all_cse:
+        logger.warning("Google CSE returned no results. Using SAMPLE_ADS demo fallback.")
+        return [
+            TopAd(
+                title=a["title"],
+                ad_text=a["ad_text"],
+                source_link=a["source_link"],
+                lat=None,
+                lon=None,
+            )
+            for a in SAMPLE_ADS
+        ]
+
+
 
     # 3) build prompt
     pois_short = [{"name": p.name, "address": p.address or "", "lat": p.lat, "lon": p.lon, "category": p.category or ""} for p in pois]
