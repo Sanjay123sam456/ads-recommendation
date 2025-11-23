@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ads Recommender — Map (Small)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--muted:#9aa4b2;--accent:#4f46e5;--glass:rgba(255,255,255,0.04)}
+    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Roboto,system-ui,-apple-system,Helvetica,Arial;background:linear-gradient(180deg,#071029 0%, #071a2a 100%);color:#e6eef8}
+    .wrap{max-width:1100px;margin:20px auto;padding:16px}
+    header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+    .logo{width:48px;height:48px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#06b6d4);display:flex;align-items:center;justify-content:center;font-weight:700;color:white}
+    h1{font-size:18px;margin:0}
+    .card{background:var(--card);border-radius:10px;padding:12px;box-shadow:0 8px 28px rgba(2,6,23,0.6);display:grid;grid-template-columns:360px 1fr;gap:12px}
+    .controls{display:flex;flex-direction:column;gap:8px}
+    input[type=text]{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);background:var(--glass);color:inherit;box-sizing:border-box}
+    .coords{display:flex;gap:8px}
+    .coords .coord-item{flex:1}
+    .actions{display:flex;gap:8px;align-items:center}
+    button{padding:8px 10px;border-radius:8px;border:0;background:var(--accent);color:white;cursor:pointer}
+    button.secondary{background:transparent;border:1px solid rgba(255,255,255,0.06)}
+    #map{height:300px;border-radius:8px;border:1px solid rgba(255,255,255,0.04)}
+    .results{margin-top:8px;display:grid;gap:8px;max-height:420px;overflow:auto;padding-right:6px}
+    .ad{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.02);display:flex;flex-direction:column}
+    .ad h3{margin:0 0 6px 0;font-size:14px}
+    .ad p{margin:0;color:var(--muted);font-size:13px}
+    .small{font-size:12px;color:var(--muted)}
+    @media(max-width:900px){ .card{grid-template-columns:1fr;} #map{height:240px} }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo">AD</div>
+      <div>
+        <h1>Ads Recommender</h1>
+        <div class="small">Type interest or use your location — ads with coordinates will be pinned on the map.</div>
+      </div>
+    </header>
+
+    <div class="card">
+      <div>
+        <div class="controls">
+          <div>
+            <input id="interest" type="text" placeholder="Your interest (electronics, food, fashion)" />
+          </div>
+
+          <div class="coords">
+            <div class="coord-item">
+              <input id="lat" type="text" inputmode="decimal" placeholder="Latitude" />
+            </div>
+            <div class="coord-item">
+              <input id="lon" type="text" inputmode="decimal" placeholder="Longitude" />
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="useLoc" class="secondary" type="button">Use my location</button>
+            <button id="searchBtn" type="button">Find Ads</button>
+            <button id="clearBtn" type="button" class="secondary">Clear</button>
+            <div style="margin-left:auto" class="small" id="status">Ready</div>
+          </div>
+        </div>
+
+        <div class="results" id="results"></div>
+      </div>
+
+      <div>
+        <div id="map"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    const latInput = document.getElementById('lat'), lonInput = document.getElementById('lon'),
+          interestInput = document.getElementById('interest'),
+          useLocBtn = document.getElementById('useLoc'),
+          searchBtn = document.getElementById('searchBtn'),
+          clearBtn = document.getElementById('clearBtn'),
+          status = document.getElementById('status'),
+          results = document.getElementById('results');
+
+    let map = L.map('map').setView([20.5937,78.9629], 5);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+    let markersLayer = L.layerGroup().addTo(map);
+
+    function setStatus(t){ status.textContent = t; }
+
+    useLocBtn.addEventListener('click', () => {
+      if (!navigator.geolocation) return setStatus('Geolocation not supported');
+      setStatus('Getting location...');
+      navigator.geolocation.getCurrentPosition((pos) => {
+        latInput.value = pos.coords.latitude.toFixed(6);
+        lonInput.value = pos.coords.longitude.toFixed(6);
+        map.setView([pos.coords.latitude, pos.coords.longitude], 13);
+        setStatus('Location filled');
+      }, (err) => setStatus('Could not get location: ' + err.message), {timeout:10000});
+    });
+
+    clearBtn.addEventListener('click', ()=>{ latInput.value=''; lonInput.value=''; results.innerHTML=''; markersLayer.clearLayers(); setStatus('Cleared'); });
+
+    function renderAdElement(ad) {
+      const el = document.createElement('div'); el.className='ad';
+      const h = document.createElement('h3'); h.textContent = ad.title || 'Untitled'; el.appendChild(h);
+      const p = document.createElement('p'); p.textContent = ad.ad_text || ''; el.appendChild(p);
+      if (ad.source_link) {
+        const a = document.createElement('a'); a.href = ad.source_link; a.target='_blank'; a.rel='noopener'; a.textContent='Source'; a.style.marginTop='8px'; el.appendChild(a);
+      }
+      if (ad.lat != null && ad.lon != null) {
+        const meta = document.createElement('div'); meta.className='small'; meta.textContent = `Pinned: ${ad.lat.toFixed(6)}, ${ad.lon.toFixed(6)}`; el.appendChild(meta);
+      } else {
+        const meta = document.createElement('div'); meta.className='small'; meta.textContent = `No coordinates (online-only or not mapped)`; el.appendChild(meta);
+      }
+      return el;
+    }
+
+    function blueIcon(){
+      return L.icon({ iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png', iconSize:[25,41], iconAnchor:[12,41] });
+    }
+
+    async function fetchAds(lat, lon, interest) {
+      markersLayer.clearLayers(); results.innerHTML=''; setStatus('Fetching...');
+      try {
+        const url = `/ads/recommend?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&interest=${encodeURIComponent(interest)}`;
+        const r = await fetch(url);
+        if (!r.ok) { setStatus('Server error: ' + r.status); return; }
+        const ads = await r.json();
+        setStatus(`Received ${ads.length} ads`);
+
+        // add markers for ads that have coords
+        let bounds = [];
+        for (const ad of ads) {
+          results.appendChild(renderAdElement(ad));
+          if (ad.lat != null && ad.lon != null) {
+            const m = L.marker([ad.lat, ad.lon], {icon: blueIcon()}).addTo(markersLayer);
+            let popupHtml = `<strong>${(ad.title||'')}</strong><br/>${(ad.ad_text||'')}`;
+            if (ad.source_link) popupHtml += `<br/><a href="${ad.source_link}" target="_blank" rel="noopener">Source</a>`;
+            m.bindPopup(popupHtml);
+            bounds.push([ad.lat, ad.lon]);
+          }
+        }
+        if (bounds.length>0) {
+          map.fitBounds(bounds, {padding:[40,40]});
+        } else {
+          // center on user lat/lon
+          map.setView([parseFloat(lat), parseFloat(lon)], 13);
+        }
+      } catch (e) {
+        setStatus('Fetch failed: ' + (e.message || e));
+      }
+    }
+
+    searchBtn.addEventListener('click', ()=>{
+      const lat = latInput.value.trim(), lon = lonInput.value.trim(), interest = interestInput.value.trim() || 'default';
+      if (!lat || !lon) { setStatus('Please provide coordinates'); return; }
+      fetchAds(lat, lon, interest);
+    });
+
+    // Enter in lon triggers
+    lonInput.addEventListener('keydown', (ev)=>{ if(ev.key==='Enter') searchBtn.click(); });
+  </script>
+</body>
+</html>
