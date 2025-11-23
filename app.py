@@ -19,7 +19,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("ad-backend")
 
-PORT = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 80))
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
