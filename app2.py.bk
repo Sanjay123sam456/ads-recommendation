@@ -1,0 +1,282 @@
+# app.py
+import os
+import time
+import json
+from typing import List, Optional, Dict, Any
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from icecream import ic
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ic(os.environ)
+
+# ---------------- Config ----------------
+PORT = int(os.getenv("PORT", 8000))
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+GOOGLE_SEARCH_API_KEY = "AIzaSyCUSIl_PmidL8ojoLX-ZD3DKBwh3BTx6F0" # os.getenv("GOOGLE_SEARCH_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+CSE_BASE = "https://www.googleapis.com/customsearch/v1"
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+print(OPENROUTER_API_KEY)
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "openai/gpt-4o"
+OPENROUTER_API_KEY = "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"
+
+# ---------------- Models ----------------
+class POI(BaseModel):
+    name: str
+    address: Optional[str]
+    lat: float
+    lon: float
+    category: Optional[str]
+
+class CSEItem(BaseModel):
+    title: Optional[str]
+    snippet: Optional[str]
+    link: Optional[str]
+
+class TopAd(BaseModel):
+    title: str
+    ad_text: str
+    source_link: Optional[str]
+
+
+
+
+# ---------------- Utilities ----------------
+def build_osm_address(tags: Dict[str, Any]) -> Optional[str]:
+    if not tags:
+        return None
+    parts = []
+    for k in ["addr:housenumber", "addr:street", "addr:suburb", "addr:city", "addr:state", "addr:postcode"]:
+        v = tags.get(k)
+        if v:
+            parts.append(v)
+    return ", ".join(parts) if parts else None
+
+def fetch_pois_osm(lat: float, lon: float, radius: int = 2000, limit: int = 10) -> List[POI]:
+    """
+    Query Overpass API for nearby commercial POIs (amenity/shop/tourism/leisure).
+    Returns up to `limit` POIs.
+    """
+    query = f"""
+    [out:json][timeout:20];
+    (
+      node(around:{radius},{lat},{lon})["amenity"];
+      node(around:{radius},{lat},{lon})["shop"];
+      node(around:{radius},{lat},{lon})["tourism"];
+      node(around:{radius},{lat},{lon})["leisure"];
+    );
+    out center;
+    """
+    r = requests.post(OVERPASS_URL, data=query, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+    pois: List[POI] = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {}) or {}
+        name = tags.get("name")
+        if not name:
+            continue
+        la = el.get("lat") or el.get("center", {}).get("lat")
+        lo = el.get("lon") or el.get("center", {}).get("lon")
+        if la is None or lo is None:
+            continue
+        cat = tags.get("shop") or tags.get("amenity") or tags.get("tourism") or tags.get("leisure")
+        addr = build_osm_address(tags)
+        try:
+            pois.append(POI(name=name, address=addr, lat=float(la), lon=float(lo), category=cat))
+        except Exception:
+            continue
+        if len(pois) >= limit:
+            break
+    return pois
+
+def call_google_cse(query: str, num: int = 10, safe: bool = True) -> Dict[str, Any]:
+    if not GOOGLE_SEARCH_API_KEY or not GOOGLE_CSE_ID:
+        raise RuntimeError("GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_ID must be set as environment variables")
+    params = {
+        "key": GOOGLE_SEARCH_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "num": num
+    }
+    ic(query)
+    if safe:
+        params["safe"] = "active"
+    url = CSE_BASE + "?" + requests.compat.urlencode(params)
+    resp = requests.get(url, timeout=12)
+    resp.raise_for_status()
+    return resp.json()
+
+def extract_cse_item(it: Dict[str, Any]) -> CSEItem:
+    return CSEItem(
+        title = it.get("title"),
+        snippet = it.get("snippet"),
+        link = it.get("link") or it.get("formattedUrl")
+    )
+
+def dedupe_cse_items(items: List[CSEItem]) -> List[CSEItem]:
+    seen = set()
+    out = []
+    for it in items:
+        key = (it.title or "") + "|" + (it.link or "") + "|" + (it.snippet or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+# ---------------- LLM helper ----------------
+def call_openrouter_generate(prompt: str, model: str = OPENROUTER_MODEL, timeout: int = 30) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not configured")
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant that selects the top 5 most relevant ads and writes short ad copy tailored to the user's interest."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 800
+    }
+    ic(headers)
+    r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    # OpenRouter / OpenAI-style responses may vary. Try common shapes.
+    if isinstance(data, dict):
+        # openrouter typical: {"id":..., "object":..., "created":..., "choices":[{"message": {"role":"assistant","content":"..."}}], ...}
+        choices = data.get("choices") or []
+        if choices:
+            first = choices[0]
+            msg = first.get("message") or {}
+            content = msg.get("content") or first.get("text")
+            return content or json.dumps(data)
+    return json.dumps(data)
+
+# ---------------- App ----------------
+app = FastAPI(title="Ads-by-Address Recommender")
+
+from fastapi.responses import HTMLResponse
+@app.get("/", response_class=HTMLResponse)
+def root():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+@app.get("/ads/recommend", response_model=List[TopAd])
+def recommend_ads(
+    lat: float,
+    lon: float,
+    interest: str = Query(..., description="User interest (e.g., electronics, food, fashion)"),
+    radius: int = Query(2000, description="Search radius in meters"),
+    poi_limit: int = Query(6, description="Max POIs to fetch from OSM"),
+    cse_per_poi: int = Query(10, description="How many Google CSE results to fetch per POI (we use 10 as requested)")
+):
+    """
+    Pipeline:
+    1) Fetch nearby POIs from OSM using coords.
+    2) For each POI, build an address-based Google search using the POI's address (or name).
+    3) Collect CSE results (10 per POI).
+    4) Send POIs + combined CSE results + interest to OpenRouter (GPT) to pick top-5 and generate ad copy.
+    """
+    # 1) OSM POIs (only OSM is used for POI/address)
+    try:
+        pois = fetch_pois_osm(lat=lat, lon=lon, radius=radius, limit=poi_limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch POIs from OSM: {e}")
+
+    ic("OSM POIs:", [p.dict() for p in pois])
+
+    if not pois:
+        return []
+
+    # 2) For each POI, form an address-based query and call Google CSE
+    all_cse_items: List[CSEItem] = []
+    for p in pois:
+        # Prefer address for queries. If no address, use POI name + city fallback.
+        location_term = p.address or p.name
+        # sanitize
+        query = f"{interest} offers / discounts FLAT UPTO %  Near {location_term}"
+        try:
+            data = call_google_cse(query, num=cse_per_poi)
+        except Exception as e:
+            # continue with remaining POIs if CSE fails for one POI
+            # but if API keys missing, return error
+            if "must be set" in str(e) or isinstance(e, RuntimeError):
+                raise HTTPException(status_code=500, detail=str(e))
+            continue
+
+        items = data.get("items", []) or []
+        cse_items = [extract_cse_item(it) for it in items]
+        all_cse_items.extend(cse_items)
+
+    # dedupe and trim
+    all_cse_items = dedupe_cse_items(all_cse_items)
+    ic("Google CSE combined results (deduped):", [it.dict() for it in all_cse_items])
+
+    # 3) Build prompt for LLM
+    # Provide concise structured JSON data in the prompt for reliable parsing.
+    pois_short = [{"name": p.name, "address": p.address or "", "category": p.category or ""} for p in pois]
+    cse_short = [{"title": it.title or "", "snippet": it.snippet or "", "link": it.link or ""} for it in all_cse_items[:50]]
+
+    prompt = (
+        "User interest: " + interest + "\n\n"
+        "Nearby POIs (name/address/category):\n" + json.dumps(pois_short, ensure_ascii=False, indent=2) + "\n\n"
+        "Google search results (title/snippet/link) collected:\n" + json.dumps(cse_short, ensure_ascii=False, indent=2) + "\n\n"
+        "Task:\n"
+        "1) Select the 5 most relevant search results for this user's interest and these POIs. Prefer the search results that have discount percentage or coupoun mentioned in them\n"
+        "2) For each selected result, produce a short ad with the following JSON structure:\n"
+        "{ \"title\": \"...\", \"ad_text\": \"... (short, catchy, 1-2 lines)\", \"source_link\": \"...\" }\n"
+        "3) Make the ad text tailored to the user's interest (e.g., mention 'electronics deals' if interest is electronics).\n"
+        "4) Return only a JSON array of up to 5 objects in the exact structure above. Do not add extra commentary.\n"
+    )
+
+    # 4) Call LLM
+    try:
+        llm_out_raw = call_openrouter_generate(prompt)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM generation failed: {e}")
+
+    ic("LLM raw output:", llm_out_raw)
+
+    # 5) Parse LLM output as JSON array
+    top_ads: List[TopAd] = []
+    try:
+        # Attempt to locate JSON inside the response.
+        # If the assistant returned text plus JSON, extract the first JSON array substring.
+        text = llm_out_raw.strip()
+        # naive extraction: find first '[' and last ']' and parse between
+        start = text.find('[')
+        end = text.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            json_text = text[start:end+1]
+            parsed = json.loads(json_text)
+        else:
+            # fallback: try parse entire text
+            parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError("LLM did not return a JSON array")
+        for obj in parsed[:5]:
+            title = obj.get("title") or ""
+            ad_text = obj.get("ad_text") or obj.get("ad") or obj.get("description") or ""
+            link = obj.get("source_link") or obj.get("link") or ""
+            top_ads.append(TopAd(title=title, ad_text=ad_text, source_link=link))
+    except Exception as e:
+        # If parsing fails, try a simple best-effort fallback: return the raw LLM text as a single ad
+        ic("LLM parse failed:", str(e))
+        top_ads = [TopAd(title="LLM output (raw)", ad_text=llm_out_raw[:800], source_link=None)]
+
+    return top_ads
+
+# ---------------- Run ----------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=True)
