@@ -152,6 +152,23 @@ def dedupe_cse_items(items: List[CSEItem]) -> List[CSEItem]:
         out.append(it)
     return out
 
+def fetch_cse_without_pois(interest: str, lat: float, lon: float, cse_per_query: int = 10) -> List[CSEItem]:
+    queries = [
+        f"{interest} offers near {lat:.5f},{lon:.5f}",
+        f"{interest} deals near me",
+        f"best {interest} shops nearby",
+    ]
+    all_items: List[CSEItem] = []
+    for q in queries:
+        try:
+            data = call_google_cse(q, num=cse_per_query)
+        except Exception as e:
+            logger.warning("CSE failure for fallback q=%s: %s", q, e)
+            continue
+        items = data.get("items", []) or []
+        all_items.extend(extract_cse_item(it) for it in items)
+    return dedupe_cse_items(all_items)
+
 def simple_name_match(text: str, name: str) -> bool:
     if not text or not name:
         return False
@@ -281,31 +298,31 @@ def recommend_ads(
     cse_per_poi: int = Query(10, description="How many Google CSE results per POI")
 ):
     # 1) fetch POIs
+    pois: List[POI] = []
     try:
         pois = fetch_pois_osm(lat, lon, radius=radius, limit=poi_limit)
     except Exception as e:
-        logger.warning("OSM fetch failed; returning fallback ads. Error: %s", e)
-        return build_fallback_ads(interest)
+        logger.warning("OSM fetch failed; continuing with CSE-only flow. Error: %s", e)
 
     ic("OSM POIs:", [p.dict() for p in pois])
 
-    if not pois:
-        logger.warning("No POIs found; returning fallback ads")
-        return build_fallback_ads(interest)
-
     # 2) collect google results per-poi (address-based queries)
     all_cse: List[CSEItem] = []
-    for p in pois:
-        location_term = p.address or p.name
-        q = f"{interest} offers near {location_term}"
-        try:
-            data = call_google_cse(q, num=cse_per_poi)
-        except Exception as e:
-            logger.warning(f"CSE failure for q={q}: {e}")
-            continue
-        items = data.get("items", []) or []
-        cse_items = [extract_cse_item(it) for it in items]
-        all_cse.extend(cse_items)
+    if pois:
+        for p in pois:
+            location_term = p.address or p.name
+            q = f"{interest} offers near {location_term}"
+            try:
+                data = call_google_cse(q, num=cse_per_poi)
+            except Exception as e:
+                logger.warning(f"CSE failure for q={q}: {e}")
+                continue
+            items = data.get("items", []) or []
+            cse_items = [extract_cse_item(it) for it in items]
+            all_cse.extend(cse_items)
+    else:
+        logger.warning("No POIs found; trying coordinate-based CSE queries.")
+        all_cse = fetch_cse_without_pois(interest, lat, lon, cse_per_query=cse_per_poi)
 
     all_cse = dedupe_cse_items(all_cse)
     ic("Google CSE combined results (deduped):", [it.dict() for it in all_cse])
