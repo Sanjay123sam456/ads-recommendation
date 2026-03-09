@@ -220,6 +220,14 @@ def extract_offer_phrase(text: str) -> Optional[str]:
 def choose_offer_text(index: int) -> str:
     return OFFER_TEMPLATES[index % len(OFFER_TEMPLATES)]
 
+def ensure_offer_text(text: str, index: int, interest: str) -> str:
+    base = (text or "").strip()
+    if not base:
+        base = f"Nearby {interest} offer."
+    if "off" in base.lower() or "buy 1 get 1" in base.lower() or "bogo" in base.lower():
+        return base
+    return f"{base} Offer: {choose_offer_text(index)}."
+
 def is_cse_item_local(item: CSEItem, local_tokens: List[str]) -> bool:
     if not local_tokens:
         return True
@@ -411,23 +419,70 @@ def recommend_ads(
 
     ic("OSM POIs:", [p.dict() for p in pois])
 
+    # If nearby POIs are available, force local/offline-first generation from POIs only.
+    # This avoids foreign CSE leakage and keeps ads tied to real nearby locations.
+    if pois:
+        pois_short = [
+            {
+                "name": p.name,
+                "address": p.address or "",
+                "lat": p.lat,
+                "lon": p.lon,
+                "category": p.category or "",
+            }
+            for p in pois[:5]
+        ]
+        prompt = (
+            "User interest: " + interest + "\n\n"
+            "Nearby local POIs (name/address/lat/lon/category):\n"
+            + json.dumps(pois_short, ensure_ascii=False, indent=2) + "\n\n"
+            "Task:\n"
+            "1) Create up to 5 ads ONLY for these nearby POIs.\n"
+            "2) Prioritize offline local stores/restaurants/services.\n"
+            "3) Each ad_text must include a concrete offer phrase like 'Flat 20% Off', 'Buy 1 Get 1', or 'Up to 30% Off'.\n"
+            "4) Return only JSON array with fields: title, ad_text, source_link.\n"
+        )
+        try:
+            llm_raw = call_gemini_generate(prompt)
+            txt = llm_raw.strip()
+            start = txt.find("[")
+            end = txt.rfind("]")
+            parsed = json.loads(txt[start:end+1]) if (start != -1 and end != -1 and end > start) else json.loads(txt)
+            if not isinstance(parsed, list):
+                raise ValueError("LLM output is not a list")
+
+            out_ads: List[TopAd] = []
+            for idx, obj in enumerate(parsed[:5]):
+                if not isinstance(obj, dict):
+                    continue
+                title = (obj.get("title") or "").strip() or f"{pois[idx % len(pois)].name} - {interest.title()} Nearby"
+                ad_text = ensure_offer_text(
+                    (obj.get("ad_text") or obj.get("ad") or obj.get("description") or "").strip(),
+                    idx,
+                    interest,
+                )
+                link = (obj.get("source_link") or obj.get("link") or "").strip() or None
+                poi = pois[idx % len(pois)]
+                out_ads.append(
+                    TopAd(
+                        title=title,
+                        ad_text=ad_text,
+                        source_link=link,
+                        lat=poi.lat,
+                        lon=poi.lon,
+                    )
+                )
+            if out_ads:
+                return out_ads
+        except Exception as e:
+            logger.warning("Local POI LLM generation failed; using POI fallback ads. Error: %s", e)
+
+        return build_ads_from_pois(pois, interest=interest, limit=5)
+
     # 2) collect google results per-poi (address-based queries)
     all_cse: List[CSEItem] = []
-    if pois:
-        for p in pois:
-            location_term = p.address or p.name
-            q = f"{interest} offers near {location_term}"
-            try:
-                data = call_google_cse(q, num=cse_per_poi)
-            except Exception as e:
-                logger.warning(f"CSE failure for q={q}: {e}")
-                continue
-            items = data.get("items", []) or []
-            cse_items = [extract_cse_item(it) for it in items]
-            all_cse.extend(cse_items)
-    else:
-        logger.warning("No POIs found; trying coordinate-based CSE queries.")
-        all_cse = fetch_cse_without_pois(interest, lat, lon, cse_per_query=cse_per_poi)
+    logger.warning("No POIs found; trying coordinate-based CSE queries.")
+    all_cse = fetch_cse_without_pois(interest, lat, lon, cse_per_query=cse_per_poi)
 
     all_cse = dedupe_cse_items(all_cse)
     local_tokens = extract_local_tokens_from_pois(pois)
