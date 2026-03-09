@@ -2,6 +2,7 @@
 import os
 import json
 import logging
+import re
 import urllib.parse
 from typing import Optional, List, Dict, Any
 
@@ -74,6 +75,19 @@ class TopAd(BaseModel):
     lon: Optional[float] = None
 
 # ---------------- UTILITIES ----------------
+GENERIC_LOCALITY_WORDS = {
+    "near", "nearby", "road", "nagar", "city", "sector", "market", "mall",
+    "block", "street", "shop", "store", "area", "district", "state", "india"
+}
+
+OFFER_TEMPLATES = [
+    "Flat 20% off on selected items",
+    "Buy 1 Get 1 on weekend specials",
+    "Up to 30% off on combo deals",
+    "Flat Rs.200 off above Rs.999",
+    "Free add-on with every purchase",
+]
+
 def build_osm_address(tags: Dict[str, Any]) -> Optional[str]:
     if not tags:
         return None
@@ -152,6 +166,56 @@ def dedupe_cse_items(items: List[CSEItem]) -> List[CSEItem]:
         out.append(it)
     return out
 
+def extract_local_tokens_from_pois(pois: List[POI]) -> List[str]:
+    tokens: set[str] = set()
+    for p in pois:
+        blob = f"{p.name or ''} {p.address or ''}".lower()
+        for tok in re.findall(r"[a-z0-9]+", blob):
+            if tok.isdigit():
+                if len(tok) >= 2:
+                    tokens.add(tok)
+                continue
+            if len(tok) < 4:
+                continue
+            if tok in GENERIC_LOCALITY_WORDS:
+                continue
+            tokens.add(tok)
+    return sorted(tokens)
+
+def extract_offer_phrase(text: str) -> Optional[str]:
+    if not text:
+        return None
+    patterns = [
+        r"(flat\s*\d{1,3}%\s*off)",
+        r"(up\s*to\s*\d{1,3}%\s*off)",
+        r"(buy\s*1\s*get\s*1)",
+        r"(bogo)",
+        r"(flat\s*rs\.?\s*\d+\s*off)",
+        r"(\d{1,3}%\s*off)",
+    ]
+    lower = text.lower()
+    for pat in patterns:
+        m = re.search(pat, lower)
+        if m:
+            phrase = m.group(1)
+            return " ".join(phrase.split()).title()
+    return None
+
+def choose_offer_text(index: int) -> str:
+    return OFFER_TEMPLATES[index % len(OFFER_TEMPLATES)]
+
+def is_cse_item_local(item: CSEItem, local_tokens: List[str]) -> bool:
+    if not local_tokens:
+        return True
+    blob = f"{item.title or ''} {item.snippet or ''} {item.link or ''}".lower()
+    return any(tok in blob for tok in local_tokens)
+
+def prioritize_local_cse(items: List[CSEItem], local_tokens: List[str], limit: int = 50) -> List[CSEItem]:
+    local_items = [it for it in items if is_cse_item_local(it, local_tokens)]
+    if local_items:
+        return local_items[:limit]
+    return items[:limit]
+
 def fetch_cse_without_pois(interest: str, lat: float, lon: float, cse_per_query: int = 10) -> List[CSEItem]:
     queries = [
         f"{interest} offers near {lat:.5f},{lon:.5f}",
@@ -227,20 +291,25 @@ def build_fallback_ads(interest: str) -> List[TopAd]:
 
 def build_ads_from_cse(items: List[CSEItem], interest: str, limit: int = 5) -> List[TopAd]:
     ads: List[TopAd] = []
-    for it in items[:limit]:
+    for idx, it in enumerate(items[:limit]):
         title = (it.title or "").strip() or f"{interest.title()} Offer"
-        snippet = (it.snippet or "").strip() or f"Explore {interest} offers near your location."
+        snippet_raw = (it.snippet or "").strip()
+        offer = extract_offer_phrase(f"{it.title or ''} {snippet_raw}") or choose_offer_text(idx)
+        snippet = snippet_raw or f"Nearby {interest} deal. Offer: {offer}."
+        if "off" not in snippet.lower() and "buy 1 get 1" not in snippet.lower() and "bogo" not in snippet.lower():
+            snippet = f"{snippet} Offer: {offer}."
         link = (it.link or "").strip() or None
         ads.append(TopAd(title=title, ad_text=snippet, source_link=link, lat=None, lon=None))
     return ads
 
 def build_ads_from_pois(pois: List[POI], interest: str, limit: int = 5) -> List[TopAd]:
     ads: List[TopAd] = []
-    for p in pois[:limit]:
+    for idx, p in enumerate(pois[:limit]):
+        offer = choose_offer_text(idx)
         ads.append(
             TopAd(
                 title=f"{p.name} - {interest.title()} Nearby",
-                ad_text=f"Local {interest} option near you at {p.name}. Visit the store for current offers.",
+                ad_text=f"Local {interest} option near you at {p.name}. Offer: {offer}.",
                 source_link=None,
                 lat=p.lat,
                 lon=p.lon,
@@ -339,6 +408,8 @@ def recommend_ads(
         all_cse = fetch_cse_without_pois(interest, lat, lon, cse_per_query=cse_per_poi)
 
     all_cse = dedupe_cse_items(all_cse)
+    local_tokens = extract_local_tokens_from_pois(pois)
+    all_cse = prioritize_local_cse(all_cse, local_tokens=local_tokens, limit=50)
     ic("Google CSE combined results (deduped):", [it.dict() for it in all_cse])
                 # If Google CSE returned no results (quota exhausted / error), return demo ads
     if not all_cse:
@@ -359,7 +430,9 @@ def recommend_ads(
         "Nearby POIs (name/address/lat/lon/category):\n" + json.dumps(pois_short, ensure_ascii=False, indent=2) + "\n\n"
         "Google search results (title/snippet/link):\n" + json.dumps(cse_short, ensure_ascii=False, indent=2) + "\n\n"
         "Task:\n"
-        "1) Select the 5 most relevant search results for this user's interest and these POIs.\n"
+        "1) Select up to 5 results that are LOCAL to the given POIs/city only. Ignore foreign-country or unrelated city results.\n"
+        "2) Prioritize OFFLINE nearby shops/restaurants/stores first, online options only after local offline options.\n"
+        "3) Each ad_text must include a concrete offer phrase like 'Flat 20% Off', 'Buy 1 Get 1', or 'Up to 30% Off'.\n"
         "2) For each selected result, produce a short ad with the following JSON structure:\n"
         "{\"title\":\"...\",\"ad_text\":\"...\",\"source_link\":\"...\"}\n"
         "3) Return only a JSON array of up to 5 objects in that exact structure. Do not add commentary."
@@ -434,7 +507,11 @@ def recommend_ads(
             ad_lat = poi.lat
             ad_lon = poi.lon
 
-        out_ads.append(TopAd(title=title or "Untitled", ad_text=ad_text or "", source_link=link, lat=ad_lat, lon=ad_lon))
+        final_text = ad_text or f"Nearby {interest} offer. Offer: {choose_offer_text(idx)}."
+        if "off" not in final_text.lower() and "buy 1 get 1" not in final_text.lower() and "bogo" not in final_text.lower():
+            final_text = f"{final_text} Offer: {choose_offer_text(idx)}."
+
+        out_ads.append(TopAd(title=title or "Untitled", ad_text=final_text, source_link=link, lat=ad_lat, lon=ad_lon))
 
     if not out_ads:
         logger.warning("LLM produced no usable ad objects; using CSE-only fallback.")
@@ -453,6 +530,9 @@ def recommend_ads(
                 break
             ad.lat = pois[i].lat
             ad.lon = pois[i].lon
+
+    # Offline first: keep local/map-able ads before pure online ads.
+    out_ads.sort(key=lambda a: 0 if (a.lat is not None and a.lon is not None) else 1)
 
     return out_ads
 
