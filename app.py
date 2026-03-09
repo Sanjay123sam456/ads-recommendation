@@ -1,13 +1,12 @@
 # app.py
 import os
-import time
 import json
 import logging
 import urllib.parse
 from typing import Optional, List, Dict, Any
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from icecream import ic
 from starlette.middleware.cors import CORSMiddleware
@@ -26,9 +25,9 @@ GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 CSE_BASE = "https://www.googleapis.com/customsearch/v1"
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_BASE = os.getenv("GEMINI_BASE", "https://generativelanguage.googleapis.com/v1beta")
 
 
 CACHE_TTL = 300
@@ -190,30 +189,71 @@ def looks_like_online_marketplace(link: Optional[str]) -> bool:
     marketplaces = ["amazon.", "flipkart.", "myntra.", "snapdeal.", "ajio.", "ebay.", "shopify.", "etsy."]
     return any(m in link for m in marketplaces)
 
+def build_fallback_ads(interest: str) -> List[TopAd]:
+    interest_label = (interest or "local").strip().title() or "Local"
+    return [
+        TopAd(
+            title=f"{interest_label} Offer - Demo",
+            ad_text=f"Live provider data is temporarily unavailable. Showing demo {interest or 'local'} offer.",
+            source_link="https://example.com/offers",
+            lat=None,
+            lon=None,
+        ),
+        TopAd(
+            title=f"Top {interest_label} Picks - Demo",
+            ad_text=f"Fallback recommendations for {interest or 'local'} while upstream APIs recover.",
+            source_link="https://example.com/recommendations",
+            lat=None,
+            lon=None,
+        ),
+    ]
+
+def build_ads_from_cse(items: List[CSEItem], interest: str, limit: int = 5) -> List[TopAd]:
+    ads: List[TopAd] = []
+    for it in items[:limit]:
+        title = (it.title or "").strip() or f"{interest.title()} Offer"
+        snippet = (it.snippet or "").strip() or f"Explore {interest} offers near your location."
+        link = (it.link or "").strip() or None
+        ads.append(TopAd(title=title, ad_text=snippet, source_link=link, lat=None, lon=None))
+    return ads
+
 # ---------------- LLM ----------------
-def call_openrouter_generate(prompt: str, model: str = OPENROUTER_MODEL, timeout: int = 30) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY not configured")
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+def call_gemini_generate(prompt: str, model: str = GEMINI_MODEL, timeout: int = 30) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+
+    url = f"{GEMINI_BASE}/models/{model}:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant that selects the top 5 most relevant ads and writes short ad copy tailored to the user's interest. Return only a JSON array of objects."},
-            {"role": "user", "content": prompt}
+        "system_instruction": {
+            "parts": [
+                {
+                    "text": (
+                        "You are a helpful assistant that selects the top 5 most relevant ads and writes short ad copy "
+                        "tailored to the user's interest. Return only a JSON array of objects."
+                    )
+                }
+            ]
+        },
+        "contents": [
+            {"parts": [{"text": prompt}]}
         ],
-        "temperature": 0.2,
-        "max_tokens": 800
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 800
+        }
     }
-    r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
+
+    r = requests.post(url, json=payload, timeout=timeout)
     r.raise_for_status()
     data = r.json()
-    choices = data.get("choices") or []
-    if choices:
-        first = choices[0]
-        msg = first.get("message") or {}
-        content = msg.get("content") or first.get("text")
-        return content or json.dumps(data)
-    return json.dumps(data)
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return json.dumps(data)
+
+    parts = ((candidates[0].get("content") or {}).get("parts")) or []
+    text_chunks = [p.get("text", "") for p in parts if isinstance(p, dict)]
+    text = "\n".join([t for t in text_chunks if t]).strip()
+    return text or json.dumps(data)
 
 # ---------------- APP ----------------
 app = FastAPI(title="Ads Recommender (coords-enabled)")
@@ -244,13 +284,14 @@ def recommend_ads(
     try:
         pois = fetch_pois_osm(lat, lon, radius=radius, limit=poi_limit)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch POIs from OSM: {e}")
+        logger.warning("OSM fetch failed; returning fallback ads. Error: %s", e)
+        return build_fallback_ads(interest)
 
     ic("OSM POIs:", [p.dict() for p in pois])
 
     if not pois:
-        # still continue but response will be empty
-        return []
+        logger.warning("No POIs found; returning fallback ads")
+        return build_fallback_ads(interest)
 
     # 2) collect google results per-poi (address-based queries)
     all_cse: List[CSEItem] = []
@@ -271,16 +312,7 @@ def recommend_ads(
                 # If Google CSE returned no results (quota exhausted / error), return demo ads
     if not all_cse:
         logger.warning("Google CSE returned no results. Using SAMPLE_ADS demo fallback.")
-        return [
-            TopAd(
-                title=a["title"],
-                ad_text=a["ad_text"],
-                source_link=a["source_link"],
-                lat=None,
-                lon=None,
-            )
-            for a in SAMPLE_ADS
-        ]
+        return build_fallback_ads(interest)
 
 
 
@@ -301,9 +333,10 @@ def recommend_ads(
 
     # 4) call LLM
     try:
-        llm_raw = call_openrouter_generate(prompt)
+        llm_raw = call_gemini_generate(prompt)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM generation failed: {e}")
+        logger.warning("LLM generation failed; using CSE-only fallback. Error: %s", e)
+        return build_ads_from_cse(all_cse, interest=interest, limit=5)
 
     ic("LLM raw output:", llm_raw)
 
@@ -319,8 +352,8 @@ def recommend_ads(
             parsed = json.loads(txt)
     except Exception as e:
         # fallback — return single raw blob as ad
-        ic("LLM parse failed:", str(e))
-        return [TopAd(title="LLM output (raw)", ad_text=llm_raw[:1000], source_link=None, lat=None, lon=None)]
+        logger.warning("LLM parse failed; using CSE-only fallback. Error: %s", e)
+        return build_ads_from_cse(all_cse, interest=interest, limit=5)
 
     # 6) For each ad, try to map coordinates:
     out_ads: List[TopAd] = []
@@ -365,7 +398,8 @@ def health():
     return {
         "ok": True,
         "google_search": {"key_set": bool(GOOGLE_SEARCH_API_KEY), "cse_set": bool(GOOGLE_CSE_ID)},
-        "openrouter": bool(OPENROUTER_API_KEY)
+        "gemini": bool(GEMINI_API_KEY),
+        "gemini_model": GEMINI_MODEL
     }
 
 if __name__ == "__main__":
