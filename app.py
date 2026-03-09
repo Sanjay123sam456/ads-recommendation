@@ -350,6 +350,9 @@ def recommend_ads(
             parsed = json.loads(txt[start:end+1])
         else:
             parsed = json.loads(txt)
+        if not isinstance(parsed, list):
+            logger.warning("LLM output was not a JSON array; using CSE-only fallback.")
+            return build_ads_from_cse(all_cse, interest=interest, limit=5)
     except Exception as e:
         # fallback — return single raw blob as ad
         logger.warning("LLM parse failed; using CSE-only fallback. Error: %s", e)
@@ -358,6 +361,8 @@ def recommend_ads(
     # 6) For each ad, try to map coordinates:
     out_ads: List[TopAd] = []
     for obj in parsed[:5]:
+        if not isinstance(obj, dict):
+            continue
         title = (obj.get("title") or "").strip()
         ad_text = (obj.get("ad_text") or obj.get("ad") or obj.get("description") or "").strip()
         link = (obj.get("source_link") or obj.get("link") or "").strip() or None
@@ -389,6 +394,10 @@ def recommend_ads(
             # else: leave None (unknown). If user wants aggressive heuristics we could try geocoding link/brand.
 
         out_ads.append(TopAd(title=title or "Untitled", ad_text=ad_text or "", source_link=link, lat=ad_lat, lon=ad_lon))
+
+    if not out_ads:
+        logger.warning("LLM produced no usable ad objects; using CSE-only fallback.")
+        return build_ads_from_cse(all_cse, interest=interest, limit=5)
 
     return out_ads
 
