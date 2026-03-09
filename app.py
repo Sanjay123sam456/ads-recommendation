@@ -394,7 +394,7 @@ def recommend_ads(
 
     # 6) For each ad, try to map coordinates:
     out_ads: List[TopAd] = []
-    for obj in parsed[:5]:
+    for idx, obj in enumerate(parsed[:5]):
         if not isinstance(obj, dict):
             continue
         title = (obj.get("title") or "").strip()
@@ -426,6 +426,13 @@ def recommend_ads(
                 ad_lat = None
                 ad_lon = None
             # else: leave None (unknown). If user wants aggressive heuristics we could try geocoding link/brand.
+
+        # If no location could be inferred from content/link, anchor to nearby POIs
+        # so results remain local and render as offline map markers.
+        if (ad_lat is None or ad_lon is None) and pois:
+            poi = pois[idx % len(pois)]
+            ad_lat = poi.lat
+            ad_lon = poi.lon
 
         out_ads.append(TopAd(title=title or "Untitled", ad_text=ad_text or "", source_link=link, lat=ad_lat, lon=ad_lon))
 
