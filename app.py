@@ -25,6 +25,9 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 CSE_BASE = "https://www.googleapis.com/customsearch/v1"
+GOOGLE_CSE_GL = os.getenv("GOOGLE_CSE_GL", "in")
+GOOGLE_CSE_CR = os.getenv("GOOGLE_CSE_CR", "countryIN")
+GOOGLE_CSE_LR = os.getenv("GOOGLE_CSE_LR", "lang_en")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
@@ -88,6 +91,10 @@ OFFER_TEMPLATES = [
     "Free add-on with every purchase",
 ]
 
+NON_LOCAL_TLDS = {
+    ".ng", ".pk", ".bd", ".lk", ".np", ".us", ".uk", ".au", ".ca", ".za", ".br", ".de", ".fr", ".it"
+}
+
 def build_osm_address(tags: Dict[str, Any]) -> Optional[str]:
     if not tags:
         return None
@@ -139,7 +146,10 @@ def call_google_cse(query: str, num: int = 10, safe: bool = True) -> Dict[str, A
         "key": GOOGLE_SEARCH_API_KEY,
         "cx": GOOGLE_CSE_ID,
         "q": query,
-        "num": num
+        "num": num,
+        "gl": GOOGLE_CSE_GL,
+        "cr": GOOGLE_CSE_CR,
+        "lr": GOOGLE_CSE_LR,
     }
     if safe:
         params["safe"] = "active"
@@ -182,6 +192,12 @@ def extract_local_tokens_from_pois(pois: List[POI]) -> List[str]:
             tokens.add(tok)
     return sorted(tokens)
 
+def is_non_local_link(link: Optional[str]) -> bool:
+    if not link:
+        return False
+    lower = link.lower()
+    return any(lower.endswith(tld) or f"{tld}/" in lower for tld in NON_LOCAL_TLDS)
+
 def extract_offer_phrase(text: str) -> Optional[str]:
     if not text:
         return None
@@ -207,13 +223,19 @@ def choose_offer_text(index: int) -> str:
 def is_cse_item_local(item: CSEItem, local_tokens: List[str]) -> bool:
     if not local_tokens:
         return True
+    if is_non_local_link(item.link):
+        return False
     blob = f"{item.title or ''} {item.snippet or ''} {item.link or ''}".lower()
-    return any(tok in blob for tok in local_tokens)
+    matched = sum(1 for tok in local_tokens if tok in blob)
+    return matched >= 2
 
 def prioritize_local_cse(items: List[CSEItem], local_tokens: List[str], limit: int = 50) -> List[CSEItem]:
     local_items = [it for it in items if is_cse_item_local(it, local_tokens)]
     if local_items:
         return local_items[:limit]
+    non_foreign = [it for it in items if not is_non_local_link(it.link)]
+    if non_foreign:
+        return non_foreign[:limit]
     return items[:limit]
 
 def fetch_cse_without_pois(interest: str, lat: float, lon: float, cse_per_query: int = 10) -> List[CSEItem]:
