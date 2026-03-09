@@ -234,6 +234,20 @@ def build_ads_from_cse(items: List[CSEItem], interest: str, limit: int = 5) -> L
         ads.append(TopAd(title=title, ad_text=snippet, source_link=link, lat=None, lon=None))
     return ads
 
+def build_ads_from_pois(pois: List[POI], interest: str, limit: int = 5) -> List[TopAd]:
+    ads: List[TopAd] = []
+    for p in pois[:limit]:
+        ads.append(
+            TopAd(
+                title=f"{p.name} - {interest.title()} Nearby",
+                ad_text=f"Local {interest} option near you at {p.name}. Visit the store for current offers.",
+                source_link=None,
+                lat=p.lat,
+                lon=p.lon,
+            )
+        )
+    return ads
+
 # ---------------- LLM ----------------
 def call_gemini_generate(prompt: str, model: str = GEMINI_MODEL, timeout: int = 30) -> str:
     if not GEMINI_API_KEY:
@@ -294,8 +308,8 @@ def recommend_ads(
     lon: float,
     interest: str = Query(..., description="User interest (e.g., electronics, food, fashion)"),
     radius: int = Query(DEFAULT_RADIUS_METERS),
-    poi_limit: int = Query(6, description="Max POIs to fetch from OSM"),
-    cse_per_poi: int = Query(10, description="How many Google CSE results per POI")
+    poi_limit: int = Query(4, description="Max POIs to fetch from OSM"),
+    cse_per_poi: int = Query(3, description="How many Google CSE results per POI")
 ):
     # 1) fetch POIs
     pois: List[POI] = []
@@ -328,6 +342,9 @@ def recommend_ads(
     ic("Google CSE combined results (deduped):", [it.dict() for it in all_cse])
                 # If Google CSE returned no results (quota exhausted / error), return demo ads
     if not all_cse:
+        if pois:
+            logger.warning("Google CSE returned no results. Using POI-based offline ads fallback.")
+            return build_ads_from_pois(pois, interest=interest, limit=5)
         logger.warning("Google CSE returned no results. Using SAMPLE_ADS demo fallback.")
         return build_fallback_ads(interest)
 
@@ -414,7 +431,21 @@ def recommend_ads(
 
     if not out_ads:
         logger.warning("LLM produced no usable ad objects; using CSE-only fallback.")
-        return build_ads_from_cse(all_cse, interest=interest, limit=5)
+        fallback_ads = build_ads_from_cse(all_cse, interest=interest, limit=5)
+        if pois:
+            for i, ad in enumerate(fallback_ads):
+                if i < len(pois):
+                    ad.lat = pois[i].lat
+                    ad.lon = pois[i].lon
+        return fallback_ads
+
+    # Ensure at least some results show as offline/local if POIs are available.
+    if pois and not any(ad.lat is not None and ad.lon is not None for ad in out_ads):
+        for i, ad in enumerate(out_ads):
+            if i >= len(pois):
+                break
+            ad.lat = pois[i].lat
+            ad.lon = pois[i].lon
 
     return out_ads
 
